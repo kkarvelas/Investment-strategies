@@ -1,0 +1,352 @@
+library(FinancialInstrument)
+library(TTR)
+library(PerformanceAnalytics)
+
+SMA.returns <- function(x,n=10,go.short=0)
+{
+  # Substitute all NAs
+  x[which(is.na(x))] <- 0 
+  # Pass as a matrix
+  x <- as.matrix(x)
+  # Number of observations
+  Nobs <- NROW(x)
+  # Create the price index, assumes geometric returns
+  y <- cumprod(x+1)
+  # Compute the moving average
+  sma <- filter(y,rep(1,n)/n,sides=1)
+  # Fill in the initial values of n with actuals
+  sma <- c(y[1:(n-1)],na.omit(sma))
+  # Get the signals and substitute with 0's
+  sma.ret <- c(x[1],ifelse(y[-Nobs] > sma[-Nobs],x[-1],go.short*x[-1]))
+  # Done, return
+  return(sma.ret)
+}
+
+RankRB <- function(x,pick=c("top","bottom")){
+  # Computes the rank of an xts object of ranking factors
+  # ranking factors are the factors that are ranked (i.e. asset returns)
+  #
+  # args:
+  #   x = xts object of ranking factors
+  #
+  # Returns:
+  #   Returns an xts object with ranks
+  #   (e.g. for ranking asset returns, the asset with the greatest return
+  #    receives a  rank of 1)
+  pick <- match.arg(pick)
+  r <- switch(pick,top = as.xts(t(apply(-x, 1, rank, na.last = "keep"))),
+              bottom = as.xts(t(apply(x, 1, rank, na.last = "keep"))))
+  return(r)
+}
+
+PickAd<- function(x,freq=c("daily","weekly","monthly","quarterly")){
+  # Converts daily data to monthly and returns only the monthly close 
+  # Note: only used with Yahoo Finance data so far
+  # Thanks to Joshua Ulrich for the Monthly Ad function
+  # 
+  # args:
+  #   x = daily price data from Yahoo Finance
+  #
+  # Returns:
+  #   xts object with the monthly adjusted close prices
+  
+  sym <- sub("\\..*$", "", names(x)[1])
+  if (freq == "daily")
+  {
+    Y <- Ad(to.daily(x, indexAt = 'NULL', drop.time = TRUE, name = sym))    
+  }
+  if (freq == "weekly")
+  {
+    Y <- Ad(to.weekly(x, indexAt = 'NULL', drop.time = TRUE, name = sym))    
+  }
+  if (freq == "monthly")
+  {
+    Y <- Ad(to.monthly(x, indexAt = 'NULL', drop.time = TRUE, name = sym))    
+  }
+  if (freq == "quarterly")
+  {
+    Y <- Ad(to.quarterly(x, indexAt = 'NULL', drop.time = TRUE, name = sym))    
+  }
+  ## Ad(x)
+  ## x<-x
+  return(Y)
+}
+
+
+CAGR <- function(x, m){
+  # Function to compute the CAGR given simple returns
+  #
+  # args:
+  #  x = xts of simple returns
+  #  m = periods per year (i.e. monthly = 12, daily = 252)
+  #
+  # Returns the Compound Annual Growth Rate
+  x <- na.omit(x)
+  cagr <- apply(x, 2, function(x, m) prod(1 + x)^(1 / (length(x) / m)) - 1, m = m)
+  return(cagr)
+}
+
+SimpleMomentumTest <- function(xts.ret, xts.rank, n = 1, ret.fill.na = 3){
+  # returns a list containing a matrix of individual asset returns
+  # and the comnbined returns
+  # args:
+  #  xts.ret = xts of one period returns
+  #  xts.rank = xts of ranks
+  #  n = number of top ranked assets to trade
+  #  ret.fill.na = number of return periods to fill with NA
+  #
+  # Returns:
+  #  returns an xts object of simple returns
+  
+  # trade the top n asset(s)
+  # if the rank of last period is less than or equal to n,
+  # then I would experience the return for this month.
+  
+  # lag the rank object by one period to avoid look ahead bias
+  lag.rank <- lag(xts.rank, k = 1, na.pad = TRUE)
+  n2 <- nrow(lag.rank[is.na(lag.rank[,1]) == TRUE])
+  z <- max(n2, ret.fill.na)
+  
+  # for trading the top ranked asset, replace all ranks above n
+  # with NA to set up for element wise multiplication to get
+  # the realized returns
+  lag.rank <- as.matrix(lag.rank)
+  lag.rank[lag.rank > n] <- NA
+  # set the element to 1 for assets ranked <= to rank
+  lag.rank[lag.rank <= n] <- 1
+  
+  # element wise multiplication of the
+  # 1 period return matrix and lagged rank matrix
+  mat.ret <- as.matrix(xts.ret) * lag.rank
+  
+  # average the rows of the mat.ret to get the
+  # return for that period
+  vec.ret <- rowMeans(mat.ret, na.rm = TRUE)
+  vec.ret[1:z] <- NA
+  
+  # convert to an xts object
+  vec.ret <- xts(x = vec.ret, order.by = index(xts.ret))
+  f <- list(mat = mat.ret, ret = vec.ret, rank = lag.rank)
+  return(f)
+}
+
+
+currency("USD")
+symbols <- c("XLE","XLU","XLK","XLB", "XLP", "XLY", "XLI", "XLV","XLF")
+stock(symbols, currency = "USD", multiplier = 1)
+
+# create new environment to store symbols
+symEnv <- new.env()
+
+# getSymbols and assign the symbols to the symEnv environment
+getSymbols(symbols, from = '2001-02-26', to = '2016-10-20', env = symEnv)
+
+# xts object of the monthly adjusted close prices
+symbols.close <- do.call(merge, eapply(symEnv, PickAd, freq="daily"))
+
+# monthly returns
+daily.returns <- ROC(x = symbols.close, n = 1, type = "discrete", na.pad = TRUE)
+
+# Convert the returns into market timing returns
+mt.returns <- apply(as.matrix(daily.returns),2,SMA.returns,n=252,go.short=0)
+mt.returns <- zoo(mt.returns,order.by=index(daily.returns))
+
+#############################################################################
+# rate of change and rank based on a single period for 3, 6, 9, and 12 months
+#############################################################################
+
+roc.one <- ROC(x = symbols.close , n = 1, type = "discrete")
+rank.one.top <- RankRB(roc.one,pick = "top")
+rank.one.bot <- RankRB(roc.one,pick = "bottom")
+
+roc.five <- ROC(x = symbols.close , n = 5, type = "discrete")
+rank.five.top <- RankRB(roc.five,pick = "top")
+rank.five.bot <- RankRB(roc.five,pick = "bottom")
+
+roc.twenty <- ROC(x = symbols.close , n = 20, type = "discrete")
+rank.twenty.top <- RankRB(roc.twenty,pick = "top")
+rank.twenty.bot <- RankRB(roc.twenty,pick = "bottom")
+
+roc.twofiftytwo <- ROC(x = symbols.close , n = 252, type = "discrete")
+rank.twofiftytwo.top <- RankRB(roc.twofiftytwo,pick = "top")
+rank.twofiftytwo.bot <- RankRB(roc.twofiftytwo,pick = "bottom")
+
+num.assets <- 2
+
+# simple momentum test based on 3 month ROC to rank
+case1.top <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.one.top,
+                                n = num.assets, ret.fill.na = 0)
+case1.bot <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.one.bot,
+                                n = num.assets, ret.fill.na = 0)
+
+# simple momentum test based on 6 month ROC to rank
+case2.top <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.five.top,
+                                n = num.assets, ret.fill.na = 0)
+case2.bot <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.five.bot,
+                                n = num.assets, ret.fill.na = 0)
+
+# simple momentum test based on 9 month ROC to rank
+case3.top <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.twenty.top,
+                                n = num.assets, ret.fill.na = 0)
+case3.bot <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.twenty.bot,
+                                n = num.assets, ret.fill.na = 0)
+
+# simple momentum test based on 12 month ROC to rank
+case4.top <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.twofiftytwo.top,
+                                n = num.assets, ret.fill.na = 0)
+case4.bot <- SimpleMomentumTest(xts.ret = mt.returns, xts.rank = rank.twofiftytwo.bot,
+                                n = num.assets, ret.fill.na = 0)
+
+
+returns.top <- cbind(case1.top$ret, case2.top$ret, case3.top$ret, case4.top$ret)
+returns.bot <- cbind(case1.bot$ret, case2.bot$ret, case3.bot$ret, case4.bot$ret)
+
+hedge1.trend <- returns.top - returns.bot
+hedge2.contr <- returns.bot - returns.top
+hedge3.085trend <- returns.top - 0.85 * returns.bot
+hedge4.015contr <- returns.bot - 0.15 * returns.top
+
+
+colnames(returns.top) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = returns.top, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Winners: Top 2 Assets")
+
+
+colnames(returns.bot) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = returns.bot, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Losers: Top 2 Assets")
+
+
+colnames(hedge1.trend) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = hedge1.trend, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Hedge Trend Following: Top 2 Assets")
+
+
+colnames(hedge2.contr) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = hedge2.contr, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Hedge Contrarian: Top 2 Assets")
+
+
+colnames(hedge3.085trend) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = hedge3.085trend, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Hedge 85% Trend Following: Top 2 Assets")
+
+
+colnames(hedge4.015contr) <- c("1-day", "5-days", "20-days", "252-days")
+
+charts.PerformanceSummary(R = hedge4.015contr, Rf = 0, geometric = TRUE, 
+                          main = "Cumulative Return of Hedge 15% Contrarian: Top 2 Assets")
+
+
+
+
+
+table.Stats(returns.top)
+table.Stats(returns.bot)
+table.Stats(hedge1.trend)
+table.Stats(hedge2.contr)
+table.Stats(hedge3.085trend)
+table.Stats(hedge4.015contr)
+
+
+
+table.AnnualizedReturns(returns.top)
+SharpeRatio.annualized(R = returns.top, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = returns.top, geometric = TRUE)
+
+
+table.AnnualizedReturns(returns.bot)
+## ypologizw pali to SharpeRatio.annualized me geometric = FALSE giati sto 
+## table.AnnualizedReturns me geometric = TRUE pou einai default de vgainei swsta
+SharpeRatio.annualized(R = returns.bot, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = returns.bot, geometric = TRUE)
+
+
+table.AnnualizedReturns(hedge1.trend)
+##TEST## ypologizw pali to SharpeRatio.annualized me geometric = FALSE giati sto 
+##TEST## table.AnnualizedReturns me geometric = TRUE pou einai default de vgainei swsta
+SharpeRatio.annualized(R = hedge1.trend, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = hedge1.trend, geometric = TRUE)
+
+
+table.AnnualizedReturns(hedge2.contr)
+##TEST## ypologizw pali to SharpeRatio.annualized me geometric = FALSE giati sto 
+##TEST## table.AnnualizedReturns me geometric = TRUE pou einai default de vgainei swsta
+SharpeRatio.annualized(R = hedge2.contr, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = hedge2.contr, geometric = TRUE)
+
+
+table.AnnualizedReturns(hedge3.085trend)
+##TEST## ypologizw pali to SharpeRatio.annualized me geometric = FALSE giati sto 
+##TEST## table.AnnualizedReturns me geometric = TRUE pou einai default de vgainei swsta
+SharpeRatio.annualized(R = hedge3.085trend, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = hedge3.085trend, geometric = TRUE)
+
+
+table.AnnualizedReturns(hedge4.015contr)
+##TEST# ypologizw pali to SharpeRatio.annualized me geometric = FALSE giati sto 
+##TEST# table.AnnualizedReturns me geometric = TRUE pou einai default de vgainei swsta
+SharpeRatio.annualized(R = hedge4.015contr, Rf = 0, scale =252, geometric = FALSE)
+Return.cumulative(R = hedge4.015contr, geometric = TRUE)
+
+#caclulate the maximum drawdown from peak equity
+maxDrawdown(returns.top, invert = FALSE)
+maxDrawdown(returns.bot, invert = FALSE)
+maxDrawdown(hedge1.trend, invert = FALSE)
+maxDrawdown(hedge2.contr, invert = FALSE)
+maxDrawdown(hedge3.085trend, invert = FALSE)
+maxDrawdown(hedge4.015contr, invert = FALSE)
+
+##StdDev(R= returns, clean = c("none"),
+##   portfolio_method = c("single"), weights = NULL, mu = NULL,
+##   sigma = NULL, use = "everything", method = c("pearson"))
+
+##  Return.annualized(R = returns.top, scale =252, geometric = TRUE)
+##  StdDev.annualized(returns.top, scale = 252)
+##  SharpeRatio.annualized(R = returns.top, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = returns.top, geometric = TRUE)
+
+
+##  Return.annualized(R = returns.bot, scale =252, geometric = TRUE)#
+##  StdDev.annualized(returns.bot, scale = 252)
+##  SharpeRatio.annualized(R = returns.bot, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = returns.bot, geometric = TRUE)
+
+
+##  Return.annualized(R = hedge1.trend, scale =252, geometric = TRUE)
+##  StdDev.annualized(hedge1.trend, scale = 252)
+##  SharpeRatio.annualized(R = hedge1.trend, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = hedge1.trend, geometric = TRUE)
+
+
+##  Return.annualized(R = hedge2.contr, scale =252, geometric = TRUE)
+##  StdDev.annualized(hedge2.contr, scale = 252)
+##  SharpeRatio.annualized(R = hedge2.contr, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = hedge2.contr, geometric = TRUE)
+
+
+##  Return.annualized(R = hedge3.085trend, scale =252, geometric = TRUE)
+##  StdDev.annualized(hedge3.085trend, scale = 252)
+##  SharpeRatio.annualized(R = hedge3.085trend, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = hedge3.085trend, geometric = TRUE)
+
+
+##  Return.annualized(R = hedge4.015contr, scale =252, geometric = TRUE)
+##  StdDev.annualized(hedge4.015contr, scale = 252)
+##  SharpeRatio.annualized(R = hedge4.015contr, Rf = 0, scale =252, geometric = FALSE)
+##  Return.cumulative(R = hedge4.015contr, geometric = TRUE)
+
+
+CAGR(returns.top, m = 252)
+CAGR(returns.bot, m = 252)
+CAGR(hedge1.trend, m = 252)
+CAGR(hedge2.contr, m = 252)
+CAGR(hedge3.085trend, m = 252)
+CAGR(hedge4.015contr, m = 252)
+
+print("End")
